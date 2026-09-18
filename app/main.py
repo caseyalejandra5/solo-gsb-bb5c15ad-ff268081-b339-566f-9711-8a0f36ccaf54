@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .audit import run_audit
 from .license_audit import run_license_audit
+from .rebuild import run_rebuild_plan
 from .jobs import (
     CANCELLED,
     FAILED,
@@ -129,6 +130,26 @@ class LicenseAuditRequest(BaseModel):
     )
 
 
+class RebuildPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, str] = Field(
+        ..., description="Package -> resolved version, as returned by /resolve."
+    )
+    dependency_graph: list[GraphEdgeInput] = Field(
+        default_factory=list,
+        description="Edges as returned by /resolve.",
+    )
+    changed: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Locally changed package names. Names are normalized like every "
+            "other input; duplicates collapse. Entries that are not resolved "
+            "are reported as 'missing'."
+        ),
+    )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """Open the SQLite job store and start the background worker.
@@ -152,7 +173,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -282,6 +303,26 @@ async def audit_licenses_endpoint(payload: LicenseAuditRequest) -> JSONResponse:
     """
     body = run_license_audit(
         payload.resolved, payload.licenses, payload.allowed, payload.denied
+    )
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.post("/plan/rebuild")
+async def plan_rebuild_endpoint(payload: RebuildPlanRequest) -> JSONResponse:
+    """Plan a deterministic rebuild for locally changed packages.
+
+    Takes the ``resolved`` mapping and ``dependency_graph`` edges from a
+    successful ``/resolve`` response plus the names of the locally changed
+    packages.  Every package that transitively depends on a changed package
+    is affected; cyclic dependencies are compressed into groups that must
+    rebuild in the same batch, and the groups are scheduled into
+    parallelizable stages, dependencies before dependents.  Each affected
+    package also lists all shortest reverse paths to the nearest changed
+    package; changed names that are not installed are reported as
+    ``missing``.  Identical input always yields an identical plan.
+    """
+    body = run_rebuild_plan(
+        payload.resolved, payload.dependency_graph, payload.changed
     )
     return JSONResponse(status_code=200, content=body)
 
