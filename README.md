@@ -38,6 +38,10 @@
   [`license-expression`](https://github.com/aboutcode-org/license-expression)
   库解析，支持括号、`AND`、`OR`、`WITH`（`WITH` 按 `AND` 分别判定许可证与例外）；
   响应给出规范化表达式与决定状态的标识符，任一表达式非法即整体返回 400。
+- **重建计划**：`POST /plan/rebuild` 接收 `/resolve` 成功响应中的 `resolved`、
+  `dependency_graph` 与本地变更包名列表，先沿反向依赖边传播得到全部受影响包，
+  再把环依赖压缩为必须同批构建的组，按“依赖先于依赖者”输出可并行的 stages；
+  每个受影响包还给出距最近 changed 包的最短反向路径，未安装的 changed 项单列。
 
 ## 一条命令启动
 
@@ -53,6 +57,7 @@ docker compose up --build
 - `POST /resolve` — 同步解析依赖（保持原有行为不变）
 - `POST /audit/vulnerabilities` — 用本地公告列表审计已解析的依赖图
 - `POST /audit/licenses` — 用本地许可证策略审计已解析的包
+- `POST /plan/rebuild` — 为本地变更包生成确定性的重建计划
 - `POST /jobs` — 提交异步解析作业（立即返回 `202` 与作业 ID）
 - `GET /jobs/{id}` — 查询作业状态与最终响应
 - `DELETE /jobs/{id}` — 取消作业
@@ -290,14 +295,101 @@ curl -s -X POST localhost:8000/audit/licenses \
 - `allowed` / `denied` 的每一项必须是单个 SPDX 标识符；
 - 包名规范化后不得重复，`<root>` 为保留名。
 
+## 重建计划 API
+
+`POST /plan/rebuild` 接收 `/resolve` **成功响应**中的 `resolved` 与
+`dependency_graph`，外加本地发生变更的包名列表 `changed`，为需要重建的包生成
+确定性计划。规划分三步：
+
+1. **反向传播**：从已安装的 changed 包出发，沿反向依赖边（“谁依赖我”）找出
+   全部传递受影响包；
+2. **环压缩**：在受影响子图上求强连通分量（SCC），同一环上的包压缩为一个
+   必须同批构建的组（自环不会额外产生阶段）；
+3. **分层排程**：按“依赖先于依赖者”给组分配阶段——一个组比它依赖的每个组
+   晚一个阶段；同一阶段内的组之间没有依赖边，可以并行构建。
+
+```bash
+curl -s -X POST localhost:8000/plan/rebuild \
+  -H 'Content-Type: application/json' -d '{
+  "resolved": {"app": "1.0", "db": "1.0", "web": "2.0", "common": "1.5"},
+  "dependency_graph": [
+    {"source": "<root>", "source_version": "", "target": "app", "target_version": "1.0"},
+    {"source": "app", "source_version": "1.0", "target": "db", "target_version": "1.0"},
+    {"source": "app", "source_version": "1.0", "target": "web", "target_version": "2.0"},
+    {"source": "db", "source_version": "1.0", "target": "common", "target_version": "1.5"},
+    {"source": "web", "source_version": "2.0", "target": "common", "target_version": "1.5"}
+  ],
+  "changed": ["common", "numpy"]
+}'
+```
+
+请求字段：
+
+- `resolved`：包名 → 已解析版本（PEP 440），即 `/resolve` 的 `resolved`。
+- `dependency_graph`：边列表，即 `/resolve` 的 `dependency_graph`；校验口径与
+  漏洞审计完全一致（无悬空边、版本必须与 `resolved` 一致、`<root>` 边的
+  `source_version` 必须为空）。
+- `changed`：本地变更包名列表，按既有规则规范化（`Foo_Bar` 与 `foo-bar`
+  视为同一个包，重复项合并）。出现在 `resolved` 中的作为传播起点；未出现的
+  单列为 `uninstalled`，不参与传播。
+
+响应（200）：
+
+```json
+{
+  "status": "ok",
+  "summary": {"changed": 1, "uninstalled": 1, "affected": 4, "groups": 4, "stages": 3},
+  "changed": ["common"],
+  "uninstalled": ["numpy"],
+  "affected": ["app", "common", "db", "web"],
+  "groups": [
+    {"id": 0, "packages": ["common"], "changed": ["common"]},
+    {"id": 1, "packages": ["db"], "changed": []},
+    {"id": 2, "packages": ["web"], "changed": []},
+    {"id": 3, "packages": ["app"], "changed": []}
+  ],
+  "stages": [[0], [1, 2], [3]],
+  "rebuild_paths": [
+    {"package": "common", "distance": 0,
+     "path": [{"name": "common", "version": "1.5"}]},
+    {"package": "db", "distance": 1,
+     "path": [{"name": "db", "version": "1.0"},
+              {"name": "common", "version": "1.5"}]},
+    {"package": "web", "distance": 1,
+     "path": [{"name": "web", "version": "2.0"},
+              {"name": "common", "version": "1.5"}]},
+    {"package": "app", "distance": 2,
+     "path": [{"name": "app", "version": "1.0"},
+              {"name": "db", "version": "1.0"},
+              {"name": "common", "version": "1.5"}]}
+  ]
+}
+```
+
+- `changed` / `uninstalled`：已安装（参与规划）与未安装（仅报告）的规范化
+  changed 包名，均按名称排序。
+- `affected`：全部受影响包（含 changed 包本身），按名称排序。
+- `groups`：压缩后的构建组；`changed` 字段标出组内的变更包。组按“依赖先于
+  依赖者”的确定性顺序编号（Tarjan SCC 发射顺序，根与邻接均排序）。
+- `stages`：每个阶段是一组可并行构建的组 id；阶段号严格按依赖关系递增
+  （changed 叶子组位于阶段 0；若某个 changed 包还依赖另一个 changed 包，
+  它会排在后续阶段，始终满足“依赖先于依赖者”）。
+- `rebuild_paths`：每个受影响包距**最近** changed 包的最短反向路径（从该包
+  沿依赖方向走到 changed 包，路径节点带已解析版本）；距离相同时按
+  （距离, 包名）排序，等距路径按字典序最小的节点序列打破平局。
+
+环依赖中的包会被压进同一个组、在同一个阶段整批重建；例如 `a ↔ b` 且 `a`
+变更时，`{"a","b"}` 是阶段 0 的一个组，依赖它们的包进入后续阶段。相同输入
+（即使边的给出顺序不同）永远得到相同的分组、阶段与路径顺序。
+
 校验规则（违反即返回 `400`，错误体与 `/resolve` 相同）：
 
 - `resolved` 中的版本必须是合法 PEP 440 版本；
-- 公告的 `affected` 必须是合法 PEP 440 说明符；
-- 边的 `source`（`<root>` 除外）与 `target` 必须出现在 `resolved` 中，否则视为
-  悬空边；
+- 边的 `source`（`<root>` 除外）与 `target` 必须出现在 `resolved` 中，否则
+  视为悬空边；
 - 边的 `source_version` / `target_version` 必须与 `resolved` 中对应版本一致
-  （`<root>` 边的 `source_version` 必须为空）。
+  （`<root>` 边的 `source_version` 必须为空）；
+- `changed` 中的名称必须是非空字符串，规范化后不得为 `<root>`。
 
 ## 数据持久化
 
@@ -458,9 +550,10 @@ app/
   serialize.py      # 冲突树 / 终态冲突的 JSON 序列化
   audit.py          # 漏洞审计：公告匹配、图一致性校验、<root> 最短路径枚举
   license_audit.py  # 许可证审计：SPDX 表达式解析、AND/OR/WITH 策略求值、决定性标识符
+  rebuild.py        # 重建计划：反向依赖传播、Tarjan 环压缩、依赖优先并行 stages、最短反向路径
   jobs.py           # SQLite 作业存储、BEGIN IMMEDIATE 原子领取、后台 worker
-  main.py           # FastAPI 应用与 /resolve、/audit/vulnerabilities、/audit/licenses、/jobs、/health
-tests/              # 端到端 API 测试（含漏洞与许可证审计）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
+  main.py           # FastAPI 应用与 /resolve、/audit/*、/plan/rebuild、/jobs、/health
+tests/              # 端到端 API 测试（含漏洞、许可证审计与重建计划）、作业持久化/取消测试、求解器单元测试（含随机暴力对照）
 data/               # 运行时生成：SQLite 数据库（RESOLVER_DB，已 gitignore）
 Dockerfile
 docker-compose.yml

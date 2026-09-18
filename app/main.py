@@ -20,6 +20,7 @@ from .jobs import (
     JobStore,
     JobWorker,
 )
+from .rebuild import run_rebuild_plan
 from .resolver import (
     ResolutionInputError,
     parse_index,
@@ -102,6 +103,26 @@ class AuditRequest(BaseModel):
     )
 
 
+class RebuildPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    resolved: dict[str, str] = Field(
+        ..., description="Package -> resolved version, as returned by /resolve."
+    )
+    dependency_graph: list[GraphEdgeInput] = Field(
+        default_factory=list,
+        description="Edges as returned by /resolve.",
+    )
+    changed: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Locally changed package names. Names absent from 'resolved' are "
+            "reported as 'uninstalled'; the rest seed reverse-dependency "
+            "propagation."
+        ),
+    )
+
+
 class LicenseAuditRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -152,7 +173,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="Local PEP 440 Dependency Resolver",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Resolves transitive dependencies from a self-contained package index. "
         "No external package index or account is used."
@@ -282,6 +303,25 @@ async def audit_licenses_endpoint(payload: LicenseAuditRequest) -> JSONResponse:
     """
     body = run_license_audit(
         payload.resolved, payload.licenses, payload.allowed, payload.denied
+    )
+    return JSONResponse(status_code=200, content=body)
+
+
+@app.post("/plan/rebuild")
+async def rebuild_plan_endpoint(payload: RebuildPlanRequest) -> JSONResponse:
+    """Plan deterministic rebuilds for locally changed packages.
+
+    Takes the ``resolved`` mapping and ``dependency_graph`` edges from a
+    successful ``/resolve`` response plus a list of changed package names.
+    Reverse-dependency propagation collects every affected package, cycles
+    are compressed into groups rebuilt as one batch, and stages are emitted
+    dependency-first so groups in one stage may build in parallel.  Each
+    affected package also reports its shortest reverse path to the nearest
+    changed package; changed names absent from ``resolved`` are listed as
+    ``uninstalled``.
+    """
+    body = run_rebuild_plan(
+        payload.resolved, payload.dependency_graph, payload.changed
     )
     return JSONResponse(status_code=200, content=body)
 
